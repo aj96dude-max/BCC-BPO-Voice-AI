@@ -1,0 +1,476 @@
+BCC BPO VOICE
+Setup, how it works, and how to install it at a client BPO
+================================================================
+
+This file is the operations guide. Use it internally when we stand
+the product up, and hand the client sections to the BPO we are
+selling to. You do not need to change code to add a new campaign.
+
+
+----------------------------------------------------------------
+1. WHAT THIS SOFTWARE IS
+----------------------------------------------------------------
+
+US inbound call centers (the customer in America dials in) are
+often staffed by humans in Pakistan and similar sites. Those
+humans take orders and intake: name, number, address, reason,
+claim details, appointment window, and so on.
+
+This product replaces that desk with an AI voice agent that:
+
+  - Answers the inbound call
+  - Speaks and listens in English
+  - Follows the campaign script for that client
+  - Collects a structured ticket (the "order")
+  - Confirms the details back to the caller
+  - Posts the ticket to the BPO's CRM / webhook
+  - Transfers to a live agent when the caller asks for a human
+    or a supervisor hits OVERRIDE in the command center
+
+One runtime covers every vertical we sell. The campaign is a JSON
+playbook, not a rewrite of the app.
+
+Built-in playbooks:
+
+  generic-inbound     Default order / intake desk
+  auto-insurance      First notice of loss
+  medical-billing     Billing questions (not clinical advice)
+  home-service        Dispatch / appointment booking
+  mortgage            Lead intake (not a loan offer)
+  final-expense       Lead intake (not a policy)
+
+A new client (Acme HVAC, a dental biller, a roofing shop) is a
+new JSON file plus a Twilio number. That is the product.
+
+
+----------------------------------------------------------------
+2. HOW A LIVE CALL WORKS
+----------------------------------------------------------------
+
+  1. Caller in the US dials the client's published number.
+  2. Twilio receives the call and POSTs to our webhook:
+       https://<our-public-host>/incoming-call
+     Optional pin:
+       https://<our-public-host>/incoming-call?campaign=medical-billing
+  3. We pick the campaign in this order:
+       a) ?campaign= query on the webhook URL
+       b) The dialed number (To) in config/number-map.json
+          or CAMPAIGN_NUMBERS in .env
+       c) DEFAULT_CAMPAIGN (generic-inbound)
+  4. Twilio opens a bidirectional audio stream to:
+       wss://<our-public-host>/audiostream
+  5. The agent greets immediately (recording disclosure is in
+     every built-in greeting).
+  6. Caller speech  -> Deepgram STT (Nova-3, 8 kHz mulaw)
+     Playbook       -> Groq LLM (captures fields, one question
+                       at a time, JSON turn)
+     Agent speech   -> ElevenLabs Flash TTS back into the call
+  7. Supervisors see the live transcript, campaign name, and
+     field checklist on the mobile command center
+     (ws:// or wss://<host>/mobile).
+  8. When all required fields are confirmed, we store an order
+     and POST it to ORDER_WEBHOOK_URL.
+  9. "I want a human" / OVERRIDE updates the Twilio call to
+     TRANSFER_SIP_URI or TRANSFER_NUMBER.
+
+Barge-in: if the caller talks over the agent, we stop TTS and
+listen.
+
+This is intake, not licensed advice. Medical playbooks must not
+give clinical advice. Mortgage / insurance playbooks must not
+quote rates or approvals. Licensed work stays on the SIP transfer.
+
+
+----------------------------------------------------------------
+3. WHAT YOU NEED BEFORE SETUP
+----------------------------------------------------------------
+
+Accounts and keys (we keep these, or the client provides their
+own if the contract says so):
+
+  - Node.js 18 or newer (or Docker)
+  - Twilio account, a US inbound number, Account SID, Auth Token
+  - Deepgram API key          (speech to text)
+  - Groq API key              (the agent brain)
+  - ElevenLabs API key        (voice)
+  - A public HTTPS / WSS URL  (ngrok, Cloudflare Tunnel, or a
+    real domain with TLS). Twilio cannot reach localhost.
+  - Optional: SIP URI or PSTN number of the BPO live-agent queue
+  - Optional: HTTPS URL of the BPO CRM / ticket API
+
+Windows (our shop) or Linux (most client servers) both work.
+
+Copy backend/.env.example to backend/.env and fill it in.
+Never commit .env. Never put keys in chat or email in the clear
+if you can send them through a password manager instead.
+
+
+----------------------------------------------------------------
+4. OUR INTERNAL BACKEND SETUP (WINDOWS)
+----------------------------------------------------------------
+
+From the project root:
+
+  cd backend
+  copy .env.example .env
+
+Edit backend/.env. Minimum for a real call:
+
+  NODE_ENV=production
+  PORT=8080
+  PUBLIC_WS_URL=wss://YOUR-TUNNEL.ngrok-free.app
+  PUBLIC_HTTP_URL=https://YOUR-TUNNEL.ngrok-free.app
+  BCC_API_KEY=long-random-string
+  COMMAND_CENTER_TOKEN=long-random-string
+  GROQ_API_KEY=...
+  DEEPGRAM_API_KEY=...
+  ELEVENLABS_API_KEY=...
+  TWILIO_ACCOUNT_SID=...
+  TWILIO_AUTH_TOKEN=...
+  DEFAULT_CAMPAIGN=generic-inbound
+
+Then:
+
+  npm install
+  npm test
+  npm start
+
+The process should log that it is listening on 8080 and list
+the loaded campaigns.
+
+Health check (browser or curl):
+
+  http://localhost:8080/health
+
+You want "ok": true. providers.groq / deepgram / elevenlabs /
+twilio become true only after those keys are set.
+
+Expose the port. In another terminal:
+
+  ngrok http 8080
+
+Put the ngrok https host into PUBLIC_HTTP_URL and the wss host
+into PUBLIC_WS_URL, then restart npm start.
+
+Twilio Console -> Phone Numbers -> the number -> Voice
+webhook (HTTP POST):
+
+  https://YOUR-TUNNEL.ngrok-free.app/incoming-call
+
+Or pin a vertical:
+
+  https://YOUR-TUNNEL.ngrok-free.app/incoming-call?campaign=auto-insurance
+
+Call the number from a US phone. You should hear the greeting.
+Watch http://localhost:8080/v1/calls and the command center.
+
+Command center (Expo, from the mobile folder):
+
+  cd mobile
+  npx expo start
+
+On a simulator use  ws://localhost:8080/mobile
+On a physical phone use  ws://YOUR-LAN-IP:8080/mobile
+In production use        wss://YOUR-HOST/mobile?token=COMMAND_CENTER_TOKEN
+
+Paste that URL into the CONNECT field and press CONNECT.
+
+
+----------------------------------------------------------------
+5. DOCKER (CLIENT SERVER OR OUR VPS)
+----------------------------------------------------------------
+
+On a machine with Docker:
+
+  copy backend\.env.example backend\.env
+  (fill keys, including PUBLIC_WS_URL and PUBLIC_HTTP_URL)
+
+  docker compose up --build -d
+
+The container publishes port 8080. Point DNS / load balancer
+at it with TLS. Twilio needs HTTPS for the webhook and WSS
+for the audio stream.
+
+Campaign JSON and number-map.json are mounted from the host
+so a BPO can edit playbooks without rebuilding the image:
+
+  backend/campaigns/*.json
+  backend/config/number-map.json
+
+
+----------------------------------------------------------------
+6. INSTALLING THIS AT A BPO WE SELL TO
+----------------------------------------------------------------
+
+Treat every client as a site install, not a custom software
+project. Same binary. Different playbook, numbers, and
+webhooks.
+
+6.1 Kickoff questions for the BPO
+---------------------------------
+  - Campaign name and vertical (billing, insurance, HVAC, ...)
+  - Inbound number(s) that US callers already dial, or new DIDs
+  - Required intake fields (name, phone, address, member ID, ...)
+  - Greeting they want on the call (must include recording notice)
+  - Where completed tickets should land (CRM URL, email, sheet)
+  - Live-agent backup: SIP of their PBX, or a DID of the floor
+  - Who on the floor watches the command center
+  - Who is allowed to press OVERRIDE
+
+6.2 Network they must give us
+-----------------------------
+  - Outbound HTTPS to Groq, Deepgram, ElevenLabs, Twilio
+  - Inbound 443 to our host (or they host it and we give them
+    the Docker image + .env)
+  - If they keep their own PBX: a SIP URI we can DIAL for
+    warm transfer (TRANSFER_SIP_URI)
+
+Two commercial models:
+
+  A) We host (typical). Client points their Twilio number, or
+     we provision the number, at our webhook. They only need
+     a CRM webhook and a SIP/queue for overflow.
+
+  B) They host (air-gapped / their VPS). We drop Docker +
+     campaigns + .env. Their IT maps 443, sets PUBLIC_* URLs,
+     and keeps the .env secrets.
+
+6.3 Map each of their numbers
+-----------------------------
+Edit backend/config/number-map.json on that install:
+
+  {
+    "default": "generic-inbound",
+    "numbers": {
+      "+18005550100": "medical-billing",
+      "+18005550101": "home-service"
+    }
+  }
+
+E.164 format, with the plus sign. Restart is not required if
+you also set CAMPAIGN_NUMBERS in .env on boot; for JSON file
+edits, POST /v1/campaigns/reload or restart the process.
+
+Or skip the file and put the campaign on the Twilio webhook
+query string (one number, one URL, simplest for a first site).
+
+6.4 Add or edit their playbook
+------------------------------
+Copy an existing file in backend/campaigns/ and change the id.
+
+  id            lowercase-dashes, unique (acme-hvac)
+  name          shown in the command center
+  greeting      first thing the caller hears
+  persona       rules for the AI (what it must never say)
+  closing       last line after a complete ticket
+  fields[]      key, label, required true/false
+  transferPhrases   words that trigger a live-agent handoff
+  complianceNotes   reminders baked into the model prompt
+
+Create/replace without a file copy:
+
+  POST https://<host>/v1/campaigns
+  Header: X-API-Key: <BCC_API_KEY>
+  Body: the JSON playbook
+
+Test the script without burning a phone minute:
+
+  POST https://<host>/v1/simulate-turn
+  { "campaignId": "acme-hvac", "userText": "I need a technician today" }
+
+Walk a few sample calls. Fix the persona until it asks the
+right questions and never invents prices or approvals.
+
+6.5 Ticket delivery into THEIR system
+-------------------------------------
+Set ORDER_WEBHOOK_URL to an HTTPS endpoint the BPO already
+has, or a small adapter they write.
+
+We POST JSON:
+
+  {
+    "id": "uuid",
+    "callId": "uuid",
+    "callSid": "CAxxxx",
+    "campaignId": "home-service",
+    "campaignName": "Home Service Dispatch",
+    "vertical": "home-services",
+    "from": "+1...",
+    "to": "+1...",
+    "fields": { "caller_name": "...", "address": "...", ... },
+    "status": "complete" | "transferred",
+    "createdAt": "ISO-8601"
+  }
+
+If ORDER_WEBHOOK_SECRET is set, we also send:
+
+  X-BCC-Signature: hex(HMAC-SHA256(secret, raw-body))
+
+They verify that header, then create the CRM ticket / order /
+lead. If they have no API yet, they can still pull:
+
+  GET /v1/orders
+  Header: X-API-Key: <BCC_API_KEY>
+
+6.6 Live agent backup
+---------------------
+On their floor, calls that the AI cannot finish must land on
+a human.
+
+  TRANSFER_SIP_URI=sip:queue-inbound@pbx.clientbpo.com
+    or
+  TRANSFER_NUMBER=+1...   (a hunt group / ring group)
+
+Without one of these, OVERRIDE and "speak to a person" will
+apologize instead of dialing. Do not go live without it.
+
+6.7 Floor supervisors
+---------------------
+Install Expo Go (or the built command-center app) on the
+supervisor phones. They enter:
+
+  wss://<client-or-our-host>/mobile?token=<COMMAND_CENTER_TOKEN>
+
+They see:
+
+  - LIVE / OFFLINE
+  - Campaign name
+  - Intake checklist as fields fill
+  - Transcript (caller vs AI)
+  - OVERRIDE  -> warm transfer of the current call
+
+Multiple supervisors can connect. Broadcast is to all of them.
+
+6.8 Go-live checklist (do not skip)
+-----------------------------------
+  [ ] .env filled, NODE_ENV=production
+  [ ] /health shows groq, deepgram, elevenlabs, twilio true
+  [ ] PUBLIC_WS_URL is wss, PUBLIC_HTTP_URL is https, same host
+  [ ] Twilio number voice webhook is POST to /incoming-call
+  [ ] Test call hears the correct greeting for that campaign
+  [ ] Required fields actually get captured (simulate-turn + live)
+  [ ] Completed ticket appears in GET /v1/orders AND at their CRM
+  [ ] "I want a human" rings their floor
+  [ ] OVERRIDE from the phone app transfers the live call
+  [ ] BCC_API_KEY and COMMAND_CENTER_TOKEN are not the examples
+  [ ] Recording disclosure is in the greeting
+  [ ] Playbook reviewed for that vertical's legal limits
+  [ ] Who owns keys, Twilio account, and uptime is in the contract
+
+
+----------------------------------------------------------------
+7. API CHEAT SHEET
+----------------------------------------------------------------
+
+  GET  /health
+  GET  /v1/campaigns
+  GET  /v1/campaigns/:id
+  POST /v1/campaigns                 create or replace playbook
+  PUT  /v1/campaigns/:id
+  POST /v1/campaigns/reload          re-read JSON files from disk
+  GET  /v1/calls
+  GET  /v1/calls/:id
+  POST /v1/calls/:id/transfer        supervisor transfer
+  GET  /v1/orders
+  GET  /v1/orders/:id
+  POST /v1/simulate-turn             test a playbook, no phone
+  POST /incoming-call                Twilio only
+
+Protected routes under /v1 need header:
+
+  X-API-Key: <BCC_API_KEY>
+
+when BCC_API_KEY is set (required in production).
+
+
+----------------------------------------------------------------
+8. WHERE THE FILES LIVE
+----------------------------------------------------------------
+
+  backend/index.js                 process entry
+  backend/.env                     secrets, never commit
+  backend/.env.example             template
+  backend/campaigns/*.json         playbooks (this is the product)
+  backend/config/number-map.json   DID -> campaign
+  backend/src/                     voice bridge, LLM, TTS, API
+  mobile/                          supervisor command center
+  docker-compose.yml               client / VPS deploy
+  README.md                        short product readme
+
+
+----------------------------------------------------------------
+9. COMMON FAILURES
+----------------------------------------------------------------
+
+  Caller hears silence, no greeting
+    PUBLIC_WS_URL missing or still localhost. Twilio never
+    reached /audiostream. Restart after setting PUBLIC_*.
+
+  Webhook 403 Invalid signature
+    TWILIO_AUTH_TOKEN wrong, or PUBLIC_HTTP_URL does not match
+    the URL Twilio is actually calling (ngrok host changed).
+
+  /health providers all false
+    .env not loaded, or you started from the wrong folder.
+    Start with:  cd backend && npm start
+
+  Agent talks about the wrong product
+    Number is mapped to the wrong campaign, or webhook has
+    the wrong ?campaign=. Check GET /v1/calls after a dial.
+
+  Tickets never hit the CRM
+    ORDER_WEBHOOK_URL down, TLS error, or they expect a
+    different JSON shape. Read backend logs for "webhook".
+    Confirm GET /v1/orders first (our side is fine).
+
+  OVERRIDE does nothing
+    No live CallSid yet, or TRANSFER_SIP_URI /
+    TRANSFER_NUMBER empty, or Twilio SID/token missing.
+
+  simulate-turn 503
+    GROQ_API_KEY not set. Expected until keys are in .env.
+
+
+----------------------------------------------------------------
+10. COMPLIANCE (SAY THIS TO THE CLIENT)
+----------------------------------------------------------------
+
+This is an intake engine. It is not, by itself:
+
+  - HIPAA certified
+  - A licensed insurance agency
+  - A mortgage lender
+  - A substitute for 911
+
+The BPO / covered entity must sign their own BAAs, lock down
+who can read /v1/orders and logs, and keep a human queue for
+anything that requires a license. We disclose recording in
+the greeting. They still own TCPA, state, and client-brand
+rules for that campaign.
+
+Medical billing playbook: billing questions only, no diagnosis.
+Auto insurance: facts only, no coverage decision, 911 if hurt.
+Mortgage / final expense: lead intake only, no rates, no "you
+are approved."
+
+
+----------------------------------------------------------------
+11. ONE-PAGE SELL / HANDOFF
+----------------------------------------------------------------
+
+What they buy: an inbound AI desk that answers US calls 24/7,
+follows THEIR script, writes the order, and dumps it into
+THEIR CRM, with a human backup on their floor.
+
+What they give us: numbers, playbook fields, CRM URL, SIP/queue.
+
+What we give them: the running system, command-center access,
+and a campaign JSON they can change without waiting on a
+developer.
+
+First live test: one DID, one playbook, five real calls, CRM
+ticket + transfer both proven, then scale the rest of the
+floor's numbers onto the same host.
+
+
+End of file.

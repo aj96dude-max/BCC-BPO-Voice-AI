@@ -1,0 +1,15 @@
+services:
+  voice:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+    volumes:
+      - ./backend/campaigns:/app/campaigns
+      - ./backend/config:/app/config
+    restart: unless-stopped

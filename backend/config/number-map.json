@@ -1,0 +1,10 @@
+{
+  "default": "generic-inbound",
+  "numbers": {
+    "+15551230001": "auto-insurance",
+    "+15551230002": "medical-billing",
+    "+15551230003": "home-service",
+    "+15551230004": "mortgage",
+    "+15551230005": "final-expense"
+  }
+}
